@@ -10,14 +10,14 @@ export default defineConfig({
         author: 'rtyt3000',
         version: '1.0.0',
         description: {
-          en: 'Holds your message while slowmode is active and sends it right after it ends',
-          ru: 'Удерживает сообщение во время slowmode и отправляет сразу после его окончания',
+          en: 'Sends your draft right after chat slowmode ends',
+          ru: 'Отправляет черновик сразу после окончания slowmode в чате',
         },
         icon: 'tg://emoji?id=5936039484796706359',
         grants: [
-          'interceptSendMessage',
+          'onUpdate(new_message)',
           'invokeRpc(channels.getFullChannel)',
-          'account.read(peers)',
+          'account.read(peers, draft)',
           'account.write(send)',
         ],
       },

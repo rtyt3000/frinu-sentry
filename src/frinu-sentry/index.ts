@@ -8,7 +8,7 @@ inu.registerSettings(inu.ui.settingsPage({
   items: () => [
     inu.ui.header('frinu-sentry'),
     inu.ui.check({
-      text: 'Send automatically when slowmode ends',
+      text: 'Send the draft when slowmode ends',
       checked: readFlag(ENABLED_KEY, true),
       onChange: (checked) => {
         writeFlag(ENABLED_KEY, checked)
@@ -17,18 +17,11 @@ inu.registerSettings(inu.ui.settingsPage({
   ],
 }))
 
-interface Queued {
-  peer: number
-  text: TextWithEntities
-  replyToMessageId?: number
-  topicId?: number
-  silent: boolean
-}
+const timers = new Map<string, number>()
 
-// seconds until the user may post in the channel again, 0 if they can right now
-async function slowmodeLeft(account: inu.Account, peer: number): Promise<number> {
-  const parsed = inu.utils.peers.parseMarkedPeerId(peer)
-  if (parsed.type !== 'channel') return 0
+// unix time when the user may post in the channel again, 0 if there is no slowmode
+async function slowmodeEnd(account: inu.Account, peer: number, sentAt: number): Promise<number> {
+  if (inu.utils.peers.parseMarkedPeerId(peer).type !== 'channel') return 0
   const input = await account.resolvePeer(peer)
   if (input._ !== 'inputPeerChannel') return 0
   const res = await account.invokeRpc({
@@ -37,57 +30,48 @@ async function slowmodeLeft(account: inu.Account, peer: number): Promise<number>
   })
   const full = res?.full_chat
   if (!full || full._ !== 'channelFull' || !full.slowmode_seconds) return 0
-  const next = full.slowmode_next_send_date ?? 0
-  return Math.max(0, next - Math.floor(Date.now() / 1000))
+  return Math.max(full.slowmode_next_send_date ?? 0, sentAt + full.slowmode_seconds)
 }
 
-function schedule(item: Queued, seconds: number): void {
-  setTimeout(() => {
-    void deliver(item)
-  }, seconds * 1000 + EXTRA_MS)
+function schedule(peer: number, topicId: number | null, endsAt: number): void {
+  const key = `${peer}:${topicId ?? 0}`
+  const prev = timers.get(key)
+  if (prev !== undefined) clearTimeout(prev)
+  const delay = Math.max(0, endsAt * 1000 - Date.now()) + EXTRA_MS
+  timers.set(key, setTimeout(() => {
+    timers.delete(key)
+    void flushDraft(peer, topicId)
+  }, delay))
 }
 
-async function deliver(item: Queued): Promise<void> {
+async function flushDraft(peer: number, topicId: number | null): Promise<void> {
+  const account = inu.account()
+  const draft = account.getDraft(peer, topicId === null ? undefined : { topicId })
+  if (!draft || !draft.text.trim()) return
   try {
-    await inu.account().sendMessage(item.peer, item.text, {
-      replyToMessageId: item.replyToMessageId,
-      topicId: item.topicId,
-      silent: item.silent,
+    await account.sendMessage(peer, draft, {
+      topicId: topicId ?? undefined,
+      clearDraft: true,
     })
   } catch (e) {
     // slowmode was extended or our estimate was off: wait the advertised time and retry
     const m = e instanceof inu.RpcError ? /^SLOWMODE_WAIT_(\d+)$/.exec(e.text) : null
     if (m) {
-      schedule(item, Number(m[1]))
+      schedule(peer, topicId, Math.floor(Date.now() / 1000) + Number(m[1]))
       return
     }
-    console.log('slowmode sender: failed to send', String(e))
-    inu.ui.toast('Slowmode sender: failed to send message')
+    console.log('frinu-sentry: failed to send draft', String(e))
+    inu.ui.toast('frinu-sentry: failed to send draft')
   }
 }
 
-inu.interceptSendMessage({ stage: 'compose', media: false, forward: false }, async ({ message, account }) => {
-  if (!readFlag(ENABLED_KEY, true)) return 'send'
-  if (message.scheduleDate !== null) return 'send'
-
-  let left = 0
-  try {
-    left = await slowmodeLeft(account, message.peer)
-  } catch (e) {
-    console.log('slowmode sender: lookup failed', String(e))
-    return 'send'
-  }
-  if (left <= 0) return 'send'
-
-  const text = message.text
-  if (!text.text.trim()) return 'send'
-  schedule({
-    peer: message.peer,
-    text: { text: text.text, entities: text.entities ? [...text.entities] : [] },
-    replyToMessageId: message.reply?.messageId,
-    topicId: message.topicId ?? undefined,
-    silent: message.silent,
-  }, left)
-  inu.ui.toast(`Slowmode: will send in ${inu.utils.formatDuration(left + 1)}`)
-  return 'drop'
+inu.onNewMessage((message, account) => {
+  if (!message.out || message.dialogId === null || !readFlag(ENABLED_KEY, true)) return
+  const peer = message.dialogId
+  const topicId = message.topicId
+  slowmodeEnd(account, peer, message.date).then((endsAt) => {
+    if (endsAt > 0) schedule(peer, topicId, endsAt)
+  }).catch((e) => {
+    console.log('frinu-sentry: slowmode lookup failed', String(e))
+  })
 })
