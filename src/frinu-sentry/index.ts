@@ -16,6 +16,8 @@ let deferNext: DeferNext | null = null
 // local ids of the held-back bubbles that the user deleted before they were sent
 const cancelled = new Set<number>()
 const timers = new Map<number, number>()
+// dialog id -> unix time the newest queued message goes out, so the next one waits for the following cooldown
+const lastEnd = new Map<number, number>()
 
 // keeps the arguments of a held-back performSendMessageRequest alive on the Java side
 const Held = inu.jvm.defineClass({
@@ -93,21 +95,26 @@ inu.xposed.hookAllOverloads(inu.jvm.cls(SEND_HELPER), 'cancelSendingMessage', {
   },
 })
 
+interface SendOpts {
+  topicId?: number
+  replyToMessageId?: number
+}
+
 // fallback when the request was not held back and the server answered with slowmode: wait and send again
-function sendLater(peer: number, topicId: number | undefined, text: string, endsAt: number): void {
+function sendLater(peer: number, opts: SendOpts, text: string, endsAt: number): void {
   const delay = Math.max(0, endsAt * 1000 - Date.now()) + EXTRA_MS
   setTimeout(() => {
-    void sendNow(peer, topicId, text)
+    void sendNow(peer, opts, text)
   }, delay)
 }
 
-async function sendNow(peer: number, topicId: number | undefined, text: string): Promise<void> {
+async function sendNow(peer: number, opts: SendOpts, text: string): Promise<void> {
   try {
-    await inu.account().sendMessage(peer, text, { topicId, clearDraft: false })
+    await inu.account().sendMessage(peer, text, { ...opts, clearDraft: false })
   } catch (e) {
     const m = e instanceof inu.RpcError ? /^SLOWMODE_WAIT_(\d+)$/.exec(e.text) : null
     if (m) {
-      sendLater(peer, topicId, text, Math.floor(Date.now() / 1000) + Number(m[1]))
+      sendLater(peer, opts, text, Math.floor(Date.now() / 1000) + Number(m[1]))
       return
     }
     console.log('frinu-sentry: failed to send', String(e))
@@ -117,19 +124,25 @@ async function sendNow(peer: number, topicId: number | undefined, text: string):
 
 interface Tap {
   dialogId: number
-  topicId: number | undefined
+  opts: SendOpts
   text: string
-  endsAt: number
+  timerEnd: number
+  cooldown: number
 }
 
 function handleTap(tap: Tap): void {
   const peer = -MARKED_CHANNEL_BASE + tap.dialogId
-  deferNext = { dialogId: tap.dialogId, endsAt: tap.endsAt }
-  inu.account().sendMessage(peer, tap.text, { topicId: tap.topicId, clearDraft: false }).catch((e) => {
+  const prev = lastEnd.get(tap.dialogId)
+  // a queued message goes out EXTRA_MS after its end and starts a new cooldown
+  const endsAt = prev === undefined ? tap.timerEnd : Math.max(tap.timerEnd, prev + 1 + tap.cooldown)
+  lastEnd.set(tap.dialogId, endsAt)
+
+  deferNext = { dialogId: tap.dialogId, endsAt }
+  inu.account().sendMessage(peer, tap.text, { ...tap.opts, clearDraft: false }).catch((e) => {
     deferNext = null
     const m = e instanceof inu.RpcError ? /^SLOWMODE_WAIT_(\d+)$/.exec(e.text) : null
     if (m) {
-      sendLater(peer, tap.topicId, tap.text, Math.floor(Date.now() / 1000) + Number(m[1]))
+      sendLater(peer, tap.opts, tap.text, Math.floor(Date.now() / 1000) + Number(m[1]))
       return
     }
     console.log('frinu-sentry: failed to send', String(e))
@@ -139,6 +152,8 @@ function handleTap(tap: Tap): void {
   setTimeout(() => {
     deferNext = null
   }, 2000)
+  const left = endsAt - Math.floor(Date.now() / 1000)
+  inu.ui.toast(`Will send in ${inu.utils.formatDuration(Math.max(left, 0) + 1)}, delete the message to cancel`)
 }
 
 const TimerClickListener = inu.jvm.defineClass({
@@ -158,6 +173,13 @@ const TimerClickListener = inu.jvm.defineClass({
         } catch (e) {
           topic = 0
         }
+        let replyTo = 0
+        try {
+          const reply = view.call('getReplyingMessageObject')
+          replyTo = reply === null ? 0 : Number(reply.call('getId'))
+        } catch (e) {
+          replyTo = 0
+        }
         const field = view.call('getFieldText')
         const text = field === null ? '' : String(field.call('toString'))
         if (!text.trim()) {
@@ -166,12 +188,21 @@ const TimerClickListener = inu.jvm.defineClass({
         }
         const timer = Number(view.getField('slowModeTimer'))
         const endsAt = timer >= UPLOADING_TIMER ? Math.floor(Date.now() / 1000) + 3 : timer
+        const info = view.getField('info')
+        const cooldown = info === null ? 0 : Number(info.getField('slowmode_seconds'))
         view.call('setFieldText', '')
+        const fragment = view.getField('parentFragment')
+        if (fragment !== null) fragment.call('hideFieldPanel', true)
         void Promise.resolve().then(() => handleTap({
           dialogId,
-          topicId: topic > 0 ? topic : undefined,
+          opts: {
+            topicId: topic > 0 ? topic : undefined,
+            // in a forum the "reply" to the topic starter is just the topic itself
+            replyToMessageId: replyTo > 0 && replyTo !== topic ? replyTo : undefined,
+          },
           text,
-          endsAt,
+          timerEnd: endsAt,
+          cooldown,
         }))
       },
     },
