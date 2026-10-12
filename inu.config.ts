@@ -17,7 +17,7 @@ export default defineConfig({
         grants: [
           'invokeRpc(channels.getFullChannel)',
           'account.read(peers, draft)',
-          'account.write(send)',
+          'account.write(send, draft)',
         ],
       },
     },

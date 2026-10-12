@@ -35,7 +35,7 @@ function arm(peer: number, topicId: number | undefined, text: TextWithEntities, 
 
 async function send(peer: number, topicId: number | undefined, text: TextWithEntities): Promise<void> {
   try {
-    await inu.account().sendMessage(peer, text, { topicId, clearDraft: true })
+    await inu.account().sendMessage(peer, text, { topicId, clearDraft: false })
   } catch (e) {
     // slowmode was extended or our estimate was off: wait the advertised time and retry
     const m = e instanceof inu.RpcError ? /^SLOWMODE_WAIT_(\d+)$/.exec(e.text) : null
@@ -72,6 +72,7 @@ inu.registerChatAction({
     try {
       const left = (await slowmodeEnd(account, dialogId)) - Math.floor(Date.now() / 1000)
       arm(dialogId, topicId, draft, Math.floor(Date.now() / 1000) + Math.max(left, 0))
+      await account.setDraft(dialogId, null, { topicId })
       inu.ui.toast(left > 0
         ? `Will send in ${inu.utils.formatDuration(left + 1)}`
         : 'No slowmode, sending')
